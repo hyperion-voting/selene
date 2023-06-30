@@ -1,5 +1,5 @@
 import random, string, hashlib
-from group import pars_2048
+
 
 import threshold_crypto as tc
 import gmpy2
@@ -10,39 +10,40 @@ from exceptions import (
     InvalidProofException,
     InvalidWFNProofException,
 )
-
+from util import deserialize_ep, deserialize_pd, serialize_pd
 from subroutines import Mixnet
+from Crypto.PublicKey import ECC
 
 
 class Voter:
-    def __init__(self, group, id, vote_min, vote_max):
+    def __init__(self, curve, id, vote_min, vote_max):
         self.id = id
         self.vote_min = vote_min
         self.vote_max = vote_max
-        self.group = group
-        self.g_ri = gmpy2.mpz(1)
+        self.curve = curve
+        self.g_ri = ECC.EccPoint(0, 0, "P-256")
 
     def choose_vote_value(self):
         self.vote = random.randrange(self.vote_min, self.vote_max)
 
     def generate_dsa_keys(self):
-        dsa = DSA(self.group)
+        dsa = DSA(self.curve)
         self.secret_key, self.public_key = dsa.keygen()
 
     def generate_trapdoor_keypair(self):
-        self.ege = ElGamalEncryption(self.group)
+        self.ege = ElGamalEncryption(self.curve)
         self.secret_trapdoor_key, self.public_trapdoor_key = self.ege.keygen()
 
     def generate_pok_trapdoor_keypair(self):
-        nizk = NIZK(self.group)
+        nizk = NIZK(self.curve)
         self.pok_trapdoor_key = nizk.prove(
             self.secret_trapdoor_key, self.public_trapdoor_key, self.id
         )
 
     def encrypt_vote(self, teller_public_key):
-        self.g_vote = self.group.raise_g(int(self.vote))
+        self.g_vote = self.curve.raise_p(int(self.vote))
         self.encrypted_vote = self.ege.encrypt(
-            teller_public_key.g_a, self.g_vote
+            teller_public_key.Q, self.g_vote
         )
 
     def generate_wellformedness_proof(self, teller_public_key):
@@ -51,19 +52,19 @@ class Voter:
             "c2": self.encrypted_vote[1],
         }
         r = self.encrypted_vote[2]
-        chmp = ChaumPedersenProof(self.group)
+        chmp = ChaumPedersenProof(self.curve)
         self.wellformedness_proof = chmp.prove_or_n(
             encrypted_vote,
             r,
-            teller_public_key.g_a,
+            teller_public_key.Q,
             self.vote_max,
             int(self.vote),
             self.id,
         )
 
     def sign_ballot(self):
-        self.dsa = DSA(self.group)
-        hash = self.group.hash_to_mpz(
+        self.dsa = DSA(self.curve)
+        hash = self.curve.hash_to_mpz(
             str(self.encrypted_vote)
             + str(self.public_trapdoor_key)
             # + str(self.pok_trapdoor_key)
@@ -84,22 +85,22 @@ class Voter:
         return bb_data
 
     def notify(self, r_i_j):
-        self.g_ri = gmpy2.f_mod(gmpy2.mul(self.g_ri, r_i_j), self.group.p)
+        self.g_ri = self.g_ri + r_i_j
 
     def retrieve_tracker(self, beta_term):
-        ege = ElGamalEncryption(self.group)
+        ege = ElGamalEncryption(self.curve)
         ciphertext = [self.g_ri, beta_term]
         self.tracker = ege.decrypt(self.secret_trapdoor_key, ciphertext)
         return self.tracker
 
 
 class Teller:
-    def __init__(self, group, secret_key_share, public_key):
-        self.group = group
+    def __init__(self, curve, secret_key_share, public_key):
+        self.curve = curve
         self.secret_key_share = secret_key_share
         self.public_key = public_key
         self.registry = []
-        self.ege = ElGamalEncryption(self.group)
+        self.ege = ElGamalEncryption(self.curve)
 
     def generate_threshold_keys(k, num_tellers, tc_key_params):
         thresh_params = tc.ThresholdParameters(k, num_tellers)
@@ -108,16 +109,16 @@ class Teller:
         )
         return pub_key, key_shares
 
-    def validate_ballot(group, teller_public_key, ballot):
-        dsa = DSA(group)
-        hash = group.hash_to_mpz(
+    def validate_ballot(curve, teller_public_key, ballot):
+        dsa = DSA(curve)
+        hash = curve.hash_to_mpz(
             str(ballot["ev"])
             + str(ballot["ptk"])
             + str(ballot["pi_1"])
             + str(ballot["pi_2"])
         )
-        nizk = NIZK(group)
-        chmp = ChaumPedersenProof(group)
+        nizk = NIZK(curve)
+        chmp = ChaumPedersenProof(curve)
         try:
             if not dsa.verify(ballot["spk"], ballot["sig"], hash):
                 raise InvalidSignatureException(ballot["id"])
@@ -126,7 +127,7 @@ class Teller:
             ciphertext = {"c1": ballot["ev"][0], "c2": ballot["ev"][1]}
             if not chmp.verify_or_n(
                 ciphertext,
-                teller_public_key.g_a,
+                teller_public_key.Q,
                 ballot["pi_2"][0],
                 ballot["pi_2"][1],
                 ballot["pi_2"][2],
@@ -167,13 +168,13 @@ class Teller:
         ciphertexts,
         partial_decryptions,
     ):
-        prod_alpha = 1
-        prod_partial_decryptions = 1
+        prod_alpha = ECC.EccPoint(0, 0, "P-256")
+        prod_partial_decryptions = ECC.EccPoint(0, 0, "P-256")
         alpha_terms = []
         for ciphertext in ciphertexts:
             index = ciphertext[0]
             alpha_terms.append(ciphertext[1][0])
-            t = gmpy2.f_mod(
+            t = (
                 gmpy2.mpz(
                     "0x"
                     + hashlib.sha256(
@@ -181,135 +182,132 @@ class Teller:
                             str(tau) + str(ciphertext[1][0]) + str(index)
                         ).encode("UTF-8")
                     ).hexdigest()
-                ),
-                self.group.q,
+                )
+                % self.curve.get_pars().order
             )
-            s_2 = gmpy2.powmod(ciphertexts[1][0], t, self.group.p)
-            prod_alpha = gmpy2.f_mod(gmpy2.mul(prod_alpha, s_2), self.group.p)
 
+            s_2 = ciphertexts[1][0] * t
+            prod_alpha = prod_alpha + s_2
         for partial_decryption in partial_decryptions:
-            prod_partial_decryptions = self.group.mul_mod_p(
-                prod_partial_decryptions, partial_decryption.v_y
+            prod_partial_decryptions = (
+                prod_partial_decryptions + partial_decryption.v_y
             )
-        u = gmpy2.f_mod(
+        u = (
             gmpy2.mpz(
                 "0x"
                 + hashlib.sha256(
                     str(
                         str(p_1)
                         + str(p_1)
-                        + str(self.group.g)
+                        + str(self.curve.get_pars().P)
                         + str(public_key_share)
                         + str(alpha_terms)
                         + str(partial_decryptions)
                     ).encode("UTF-8")
                 ).hexdigest()
-            ),
-            self.group.q,
+            )
+            % self.curve.get_pars().order
         )
-        v_1 = self.group.mul_mod_p(
-            self.group.raise_g(w),
-            gmpy2.powmod(public_key_share, u, self.group.p),
-        )
-        v_2 = gmpy2.powmod(prod_alpha, w, self.group.p)
-        v_2 = self.group.mul_mod_p(
-            v_2, gmpy2.powmod(prod_partial_decryptions, u, self.group.p)
-        )
+        v_1 = self.curve.raise_p(w) + (public_key_share * u)
+        v_2 = prod_alpha * w
+        v_2 = v_2 + (prod_partial_decryptions * u)
         if (p_1 == v_1) and (p_2 == v_2):
             return 1
         return 0
 
-    def mp_partial_decrypt_single(self, ciphertexts_in, q1,q2):
-        tau = self.group.get_random()
-        r = self.group.get_random()
-        p_1 = self.group.raise_g(r)
+    def mp_partial_decrypt_single(self, ciphertexts_in, q1, q2):
+        tau = self.curve.get_random()
+        r = self.curve.get_random()
+        p_1 = self.curve.raise_p(r)
         comm_tau = hashlib.sha256(str(tau).encode("UTF-8")).hexdigest()
         output = []
         proof = []
-        prod_alpha = 1
+        prod_alpha_1 = ECC.EccPoint(0, 0, "P-256")
         alpha_terms = []
         index = 0
         for ciphertext in ciphertexts_in:
-            alpha = ciphertext['comm']
-            t = gmpy2.f_mod(
+            alpha = ciphertext["comm"]
+            t = (
                 gmpy2.mpz(
                     "0x"
                     + hashlib.sha256(
-                        str(str(tau) + str(alpha) + str(index)).encode(
-                            "UTF-8"
-                        )
+                        str(str(tau) + str(alpha) + str(index)).encode("UTF-8")
                     ).hexdigest()
-                ),
-                self.group.q,
+                )
+                % self.curve.get_pars().order
             )
+
             index = index + 1
             pd = self.ege.partial_decrypt(
-                ciphertext['comm'], self.secret_key_share
+                ECC.EccPoint(
+                    ciphertext["comm"][0]["x"],
+                    ciphertext["comm"][0]["y"],
+                    ciphertext["comm"][0]["curve"],
+                ),
+                self.secret_key_share,
             )
-            prod_alpha = self.group.mul_mod_p(
-                prod_alpha, gmpy2.powmod(alpha, t, self.group.p)
-            )
+            prod_alpha = prod_alpha + (deserialize_ep(alpha) * t)
             alpha_terms.append(alpha)
             temp = []
 
             temp.append(index)
-            temp.append(pd)
+            temp.append(serialize_pd(pd))
 
             output.append(temp)
-            
+
         q1.put(output)
-        
-        p_2 = gmpy2.powmod(prod_alpha, r, self.group.p)
-        u = gmpy2.f_mod(
+
+        p_2 = prod_alpha * r
+        u = (
             gmpy2.mpz(
                 "0x"
                 + hashlib.sha256(
                     str(
                         str(p_1)
                         + str(p_2)
-                        + str(self.group.g)
-                        + str(self.group.raise_g(self.secret_key_share.y))
+                        + str(self.curve.get_pars().P.x)
+                        + str(self.curve.get_pars().P.y)
+                        + str(self.curve.raise_p(self.secret_key_share.y))
                         + str(alpha_terms)
                         + str(output)
                     ).encode("UTF-8")
                 ).hexdigest()
-            ),
-            self.group.q,
+            )
+            % self.curve.get_pars().order
         )
-        w = self.group.sub_mod_q(
-            r, self.group.mul_mod_q(u, self.secret_key_share.y)
-        )
+
+        w = r - (u * self.secret_key_share.y)
         q2.put(
             {
-                "p_1": p_1,
-                "p_2": p_2,
+                "p_1": tc.data._ecc_point_to_serializable(p_1),
+                "p_2": tc.data._ecc_point_to_serializable(p_2),
                 "w": w,
                 "tau": tau,
-                
             }
         )
 
     def mp_partial_decrypt(self, ciphertexts_in, q1, q2, q3):
-        tau_1 = self.group.get_random()
-        tau_2 = self.group.get_random()
-        r_1 = self.group.get_random()
-        r_2 = self.group.get_random()
-        p_1_1 = self.group.raise_g(r_1)
-        p_2_1 = self.group.raise_g(r_2)
+        tau_1 = self.curve.get_random()
+        tau_2 = self.curve.get_random()
+        r_1 = self.curve.get_random()
+        r_2 = self.curve.get_random()
+        p_1_1 = self.curve.raise_p(r_1)
+        p_2_1 = self.curve.raise_p(r_2)
         comm_tau_1 = hashlib.sha256(str(tau_1).encode("UTF-8")).hexdigest()
         comm_tau_2 = hashlib.sha256(str(tau_2).encode("UTF-8")).hexdigest()
         output = []
         output2 = []
         proof = []
-        prod_alpha_1 = 1
-        prod_alpha_2 = 1
+        prod_alpha_1 = ECC.EccPoint(0, 0, "P-256")
+        prod_alpha_2 = ECC.EccPoint(0, 0, "P-256")
         alpha_terms_1 = []
         alpha_terms_2 = []
+        flag = 0
         for ciphertext in ciphertexts_in:
             index = ciphertext[0]
             alpha_1 = ciphertext[1][0]
             alpha_2 = ciphertext[2][0]
-            t_1 = gmpy2.f_mod(
+            t_1 = (
                 gmpy2.mpz(
                     "0x"
                     + hashlib.sha256(
@@ -317,10 +315,10 @@ class Teller:
                             "UTF-8"
                         )
                     ).hexdigest()
-                ),
-                self.group.q,
+                )
+                % self.curve.get_pars().order
             )
-            t_2 = gmpy2.f_mod(
+            t_2 = (
                 gmpy2.mpz(
                     "0x"
                     + hashlib.sha256(
@@ -328,81 +326,98 @@ class Teller:
                             "UTF-8"
                         )
                     ).hexdigest()
-                ),
-                self.group.q,
+                )
+                % self.curve.get_pars().order
             )
+
             pd_1 = self.ege.partial_decrypt(
-                ciphertext[1], self.secret_key_share
+                ECC.EccPoint(
+                    ciphertext[1][0]["x"],
+                    ciphertext[1][0]["y"],
+                    ciphertext[1][0]["curve"],
+                ),
+                self.secret_key_share,
             )
             pd_2 = self.ege.partial_decrypt(
-                ciphertext[2], self.secret_key_share
+                ECC.EccPoint(
+                    ciphertext[2][0]["x"],
+                    ciphertext[2][0]["y"],
+                    ciphertext[2][0]["curve"],
+                ),
+                self.secret_key_share,
             )
-            prod_alpha_1 = self.group.mul_mod_p(
-                prod_alpha_1, gmpy2.powmod(alpha_1, t_1, self.group.p)
-            )
-            prod_alpha_2 = self.group.mul_mod_p(
-                prod_alpha_2, gmpy2.powmod(alpha_2, t_2, self.group.p)
-            )
+            if flag == 0:
+                flag = 1
+                prod_alpha_1 = deserialize_ep(alpha_1) * t_1
+
+                prod_alpha_2 = deserialize_ep(alpha_2) * t_2
+
+            else:
+                prod_alpha_1 = prod_alpha_1 + (deserialize_ep(alpha_1) * t_1)
+
+                prod_alpha_2 = prod_alpha_2 + (deserialize_ep(alpha_2) * t_2)
+
             alpha_terms_1.append(alpha_1)
             alpha_terms_2.append(alpha_2)
             temp = []
 
             temp.append(index)
-            temp.append(pd_1)
+            temp.append(serialize_pd(pd_1))
 
             output.append(temp)
             temp2 = []
             temp2.append(index)
-            temp2.append(pd_2)
+            temp2.append(serialize_pd(pd_2))
             output2.append(temp2)
         q1.put(output)
         q2.put(output2)
-        p_1_2 = gmpy2.powmod(prod_alpha_1, r_1, self.group.p)
-        p_2_2 = gmpy2.powmod(prod_alpha_2, r_2, self.group.p)
-        u_1 = gmpy2.f_mod(
+
+        p_1_2 = prod_alpha_1 * r_1
+        p_2_2 = prod_alpha_2 * r_2
+        u_1 = (
             gmpy2.mpz(
                 "0x"
                 + hashlib.sha256(
                     str(
                         str(p_1_1)
                         + str(p_1_2)
-                        + str(self.group.g)
-                        + str(self.group.raise_g(self.secret_key_share.y))
+                        + str(self.curve.get_pars().P.x)
+                        + str(self.curve.get_pars().P.y)
+                        + str(self.curve.raise_p(self.secret_key_share.y))
                         + str(alpha_terms_1)
                         + str(output)
                     ).encode("UTF-8")
                 ).hexdigest()
-            ),
-            self.group.q,
+            )
+            % self.curve.get_pars().order
         )
-        u_2 = gmpy2.f_mod(
+
+        u_2 = (
             gmpy2.mpz(
                 "0x"
                 + hashlib.sha256(
                     str(
                         str(p_2_1)
                         + str(p_2_2)
-                        + str(self.group.g)
-                        + str(self.group.raise_g(self.secret_key_share.y))
+                        + str(self.curve.get_pars().P.x)
+                        + str(self.curve.get_pars().P.y)
+                        + str(self.curve.raise_p(self.secret_key_share.y))
                         + str(alpha_terms_2)
                         + str(output2)
                     ).encode("UTF-8")
                 ).hexdigest()
-            ),
-            self.group.q,
+            )
+            % self.curve.get_pars().order
         )
-        w_1 = self.group.sub_mod_q(
-            r_1, self.group.mul_mod_q(u_1, self.secret_key_share.y)
-        )
-        w_2 = self.group.sub_mod_q(
-            r_2, self.group.mul_mod_q(u_2, self.secret_key_share.y)
-        )
+
+        w_1 = r_1 - (u_1 * self.secret_key_share.y)
+        w_2 = r_2 - (u_2 * self.secret_key_share.y)
         q3.put(
             {
-                "p_1_1": p_1_1,
-                "p_1_2": p_1_2,
-                "p_2_1": p_2_1,
-                "p_2_2": p_2_2,
+                "p_1_1": tc.data._ecc_point_to_serializable(p_1_1),
+                "p_1_2": tc.data._ecc_point_to_serializable(p_1_2),
+                "p_2_1": tc.data._ecc_point_to_serializable(p_2_1),
+                "p_2_2": tc.data._ecc_point_to_serializable(p_2_2),
                 "w_1": w_1,
                 "w_2": w_2,
                 "tau_1": tau_1,
@@ -421,20 +436,24 @@ class Teller:
         for item in pd1_in:
             index = item[0]
             ct = self.multi_dim_index(ciphertexts, index)
-            ciphertext = tc.EncryptedMessage(ct[col][0], ct[col][1], "")
+            ciphertext = tc.EncryptedMessage(
+                deserialize_ep(ct[col][0]), deserialize_ep(ct[col][1]), ""
+            )
+
             result.append(
                 [
                     index,
-                    self.ege.threshold_decrypt(
-                        item[1],
-                        ciphertext,
-                        tc.ThresholdParameters(2, 3),
-                        pars_2048(),
+                    tc.data._ecc_point_to_serializable(
+                        self.ege.threshold_decrypt(
+                            item[1],
+                            ciphertext,
+                            tc.ThresholdParameters(2, 3),
+                        )
                     ),
                 ]
             )
         q1.put(result)
-    
+
     def mp_full_decrypt_single(self, pd1_in, ciphertexts, q1):
         result = []
         for item in pd1_in:
@@ -448,12 +467,10 @@ class Teller:
                         item[1],
                         ciphertext,
                         tc.ThresholdParameters(2, 3),
-                        pars_2048(),
                     ),
                 ]
             )
         q1.put(result)
-
 
     def full_decrypt(self, pd_in, q1):
         global decrypted
@@ -473,15 +490,15 @@ class Teller:
 
         for p in processes:
             p.join()
-            p.close()
+            # p.close()
         decrypted = data
 
-    def verify_proof_h_r(group, teller_public_key, ballot):
-        nizk = NIZK(group)
+    def verify_proof_h_r(curve, teller_public_key, ballot):
+        nizk = NIZK(curve)
         try:
             if not nizk.verify_2(
                 ballot["h_r"],
-                teller_public_key.g_a,
+                teller_public_key.Q,
                 ballot["ptk"],
                 ballot["proof_h_r"],
             ):
@@ -490,14 +507,14 @@ class Teller:
             print(e)
 
     def re_encryption_mix(self, list_0):
-        mx = Mixnet(self.group)
-        proof = mx.re_encryption_mix(list_0, self.public_key.g_a)
+        mx = Mixnet(self.curve)
+        proof = mx.re_encryption_mix(list_0, self.public_key.Q)
         return proof
 
     def verify_re_enc_mix(self, list_0, proof):
-        mx = Mixnet(self.group)
+        mx = Mixnet(self.curve)
         return mx.verify_mix(
-            self.public_key.g_a,
+            self.public_key.Q,
             list_0,
             proof[0],
             proof[1],
@@ -521,12 +538,12 @@ class Teller:
             proof[19],
         )
 
-    def rencryption_mix_trackers(self, encrypted_trackers):
-        mx = Mixnet(self.group)
-        proof = mx.mix_trackers(encrypted_trackers, self.public_key.g_a)
+    def re_encryption_mix_trackers(self, encrypted_trackers):
+        mx = Mixnet(self.curve)
+        proof = mx.mix_trackers(encrypted_trackers, self.public_key.Q)
         list_1 = proof[0]
-        mx.verify_mix_trackers(
-            self.public_key.g_a,
+        """
+        mx.verify_mix_trackers(self.public_key.Q,
             encrypted_trackers,
             proof[0],
             proof[1],
@@ -545,20 +562,20 @@ class Teller:
             proof[14],
             proof[15],
             proof[16],
-        )
+        )"""
 
         return list_1
 
     def generate_tracker_commitments(self, tracker_voter_pairs):
         commitments = []
         for tracker_voter_pair in tracker_voter_pairs:
-            r_i = self.group.get_random()
-            h_ri = gmpy2.powmod(tracker_voter_pair[1], r_i, self.group.p)
-            g_ri = self.group.raise_g(r_i)
-            ege = ElGamalEncryption(self.group)
-            enc_h_ri = ege.encrypt(self.public_key.g_a, h_ri)
-            enc_g_ri = ege.encrypt(self.public_key.g_a, g_ri)
-            nizk = NIZK(self.group)
+            r_i = self.curve.get_random()
+            h_ri = tracker_voter_pair[1] * r_i
+            g_ri = self.curve.raise_p(r_i)
+            ege = ElGamalEncryption(self.curve)
+            enc_h_ri = ege.encrypt(self.public_key.Q, h_ri)
+            enc_g_ri = ege.encrypt(self.public_key.Q, g_ri)
+            nizk = NIZK(self.curve)
             proof_1_1 = nizk.prove(
                 enc_h_ri[2], enc_h_ri[0], tracker_voter_pair[0]
             )
@@ -567,16 +584,13 @@ class Teller:
             )
             # print(nizk.verify(proof_1_1,enc_h_ri[0],tracker_voter_pair[0]))
             # print(nizk.verify(proof_1_2,enc_g_ri[0],tracker_voter_pair[0]))
-            t = self.group.get_random()
-            cpp = ChaumPedersenProof(self.group)
+            t = self.curve.get_random()
+            cpp = ChaumPedersenProof(self.curve)
 
-            enc_h_ri_t = {
-                "c1": gmpy2.powmod(enc_h_ri[0], t, self.group.p),
-                "c2": gmpy2.powmod(enc_h_ri[1], t, self.group.p),
-            }
+            enc_h_ri_t = {"c1": (enc_h_ri[0] * t), "c2": (enc_h_ri[1] * t)}
             enc_g_ri_t = {
-                "c1": gmpy2.powmod(enc_g_ri[0], t, self.group.p),
-                "c2": gmpy2.powmod(enc_g_ri[1], t, self.group.p),
+                "c1": (enc_g_ri[0] * t),
+                "c2": (enc_g_ri[1] * t),
             }
 
             proof_2_1 = cpp.prove_dleq(enc_g_ri[0], enc_g_ri[1], t)
@@ -586,14 +600,14 @@ class Teller:
             # print("delq22: "+str(cpp.verify_dleq(proof_2_2,enc_h_ri[0],enc_h_ri[1],enc_h_ri_t['c1'],enc_h_ri_t['c2'])))
             # print("delq23: "+str(cpp.verify_dleq(proof_2_3,enc_g_ri[0],enc_h_ri[0],enc_g_ri_t['c1'],enc_h_ri_t['c1'])))
 
-            g_ri_t = gmpy2.powmod(g_ri, t, self.group.p)
-            h_ri_t = gmpy2.powmod(h_ri, t, self.group.p)
+            g_ri_t = g_ri * t
+            h_ri_t = h_ri * t
 
-            rhs_3_1 = gmpy2.divm(enc_g_ri[1], g_ri, self.group.p)
-            rhs_3_1_t = gmpy2.divm(enc_g_ri_t["c2"], g_ri_t, self.group.p)
+            rhs_3_1 = enc_g_ri[1] + (-g_ri)
+            rhs_3_1_t = enc_g_ri_t["c2"] + (-g_ri_t)
 
-            rhs_3_2 = gmpy2.divm(enc_h_ri[1], h_ri, self.group.p)
-            rhs_3_2_t = gmpy2.divm(enc_h_ri_t["c2"], h_ri_t, self.group.p)
+            rhs_3_2 = enc_h_ri[1] + (-h_ri)
+            rhs_3_2_t = enc_h_ri_t["c2"] + (-h_ri_t)
 
             proof_3_1 = cpp.prove_dleq(enc_g_ri[0], rhs_3_1, t)
             # print("delq31: "+str(cpp.verify_dleq(proof_3_1,enc_g_ri[0],rhs_3_1,enc_g_ri_t['c1'],rhs_3_1_t)))
@@ -605,7 +619,7 @@ class Teller:
             # print("delq4: "+str(cpp.verify_dleq(proof_4,g_ri,h_ri,g_ri_t,h_ri_t)))
 
             proof_5 = nizk.prove(
-                gmpy2.f_mod(gmpy2.mul(r_i, t), self.group.q),
+                (r_i * t),
                 g_ri_t,
                 tracker_voter_pair[0],
             )
@@ -639,16 +653,16 @@ class Teller:
             if entry["id"] == voter_id:
                 return entry["g_ri"]
 
-    def decrypt(group, registry_entry):
-        ege = ElGamalEncryption(group)
-        g_ri = group.raise_g(registry_entry["r_i"])
+    def decrypt(curve, registry_entry):
+        ege = ElGamalEncryption(curve)
+        g_ri = curve.raise_p(registry_entry["r_i"])
         ciphertext = ege.encrypt(registry_entry["ptk"], g_ri)
         return ciphertext
 
 
 class ElectionAuthority:
-    def __init__(self, group):
-        self.group = group
+    def __init__(self, curve):
+        self.curve = curve
 
     def generate_trackers(self, length, number):
         source = string.ascii_uppercase + string.digits
@@ -665,8 +679,8 @@ class ElectionAuthority:
             g_trackers.append(
                 {
                     "tracker": tracker,
-                    "g_tracker": self.group.raise_g(
-                        self.group.hash_to_mpz(tracker)
+                    "g_tracker": self.curve.raise_p(
+                        self.curve.hash_to_mpz(tracker)
                     ),
                 }
             )
@@ -674,7 +688,7 @@ class ElectionAuthority:
 
     def encrypt_trackers(self, public_key, trackers):
         encrypted_trackers = []
-        ege = ElGamalEncryption(self.group)
+        ege = ElGamalEncryption(self.curve)
         for tracker in trackers:
             encrypted_trackers.append(
                 ege.encrypt(public_key, tracker["g_tracker"])
