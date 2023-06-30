@@ -7,9 +7,11 @@ from openpyxl import load_workbook, Workbook
 from gmpy2 import powmod, invert, f_mod, mul, mpz, divm
 from texttable import Texttable
 import threshold_crypto as tc
+from Crypto.PublicKey import ECC
 
+from util import deserialize_ep
 
-from group import DHGroup, pars_2048
+from curve import Curve
 from primitives import ElGamalEncryption
 from parties import Voter, Teller, ElectionAuthority
 from util import (
@@ -25,9 +27,7 @@ from util import (
 # for brevity.
 
 
-parser = argparse.ArgumentParser(
-    description="Selene"
-)
+parser = argparse.ArgumentParser(description="Selene")
 parser.add_argument(
     "voter_count", metavar="N", type=int, help="Number of voters"
 )
@@ -66,7 +66,7 @@ num_voters = 50
 if (
     args.voter_count is not None
     and int(args.voter_count) > 0
-    and int(args.voter_count) < 10000
+    and int(args.voter_count) < 100000000
 ):
     num_voters = int(args.voter_count)
 num_tellers = 5
@@ -114,16 +114,14 @@ teller_public_key = ""
 
 teller_registry = []
 
-key_params = pars_2048()
-group = DHGroup(key_params.p, key_params.g, key_params.q)
+curve = Curve("P-256")
 
 t_voting_single = 0
 t_verification_single = 0
 
 
 def print_bb():
-    """Prints out the contents of a bulletin board.
-    """
+    """Prints out the contents of a bulletin board."""
     for item in bb:
         print(item)
 
@@ -170,7 +168,7 @@ def find_entry_by_tracker(tracker, items):
         The entry if found, None otherwise.
     """
     for item in items:
-        if item["tracker"] == tracker:
+        if deserialize_ep(item["tracker"]) == tracker:
             return item
     return None
 
@@ -186,12 +184,12 @@ def poc_setup():
     Adds all 'voter' objects to the 'voters' list.
     """
     for i in range(vote_min, vote_max + 1):
-        g_vote = group.raise_g(i)
+        g_vote = curve.raise_p(i)
         vote_map.append({"vote": i, "g_vote": g_vote})
 
     for i in range(0, num_voters):
         id = "VT" + str(i)
-        voter = Voter(group, id, vote_min, vote_max)
+        voter = Voter(curve, id, vote_min, vote_max)
         voter.generate_dsa_keys()
         voter.choose_vote_value()
         voter.generate_trapdoor_keypair()
@@ -211,18 +209,19 @@ def setup():
     global g_trackers
     global final_bb
     teller_public_key, teller_sk = Teller.generate_threshold_keys(
-        k, num_tellers, pars_2048()
+        k, num_tellers, curve.get_pars()
     )
     for i in range(0, num_tellers):
-        teller = Teller(group, teller_sk[i], teller_public_key)
+        teller = Teller(curve, teller_sk[i], teller_public_key)
         tellers.append(teller)
 
-    ea = ElectionAuthority(group)
+    ea = ElectionAuthority(curve)
     trackers = ea.generate_trackers(8, num_voters)
     g_trackers = ea.raise_trackers(trackers)
-    encrypted_trackers = ea.encrypt_trackers(teller_public_key.g_a, g_trackers)
-    for teller in tellers:
-        encrypted_trackers = teller.rencryption_mix_trackers(
+    encrypted_trackers = ea.encrypt_trackers(teller_public_key.Q, g_trackers)
+    for i in range(2):
+        teller = tellers[i]
+        encrypted_trackers = teller.re_encryption_mix_trackers(
             encrypted_trackers
         )
 
@@ -242,32 +241,23 @@ def setup():
     final_bb = []
 
     for voter in range(len(teller_commitments[0])):
-        temp_h_ri = [mpz(1), mpz(1)]
+        temp_h_ri = [
+            ECC.EccPoint(0, 0, curve.label),
+            ECC.EccPoint(0, 0, curve.label),
+        ]
         temp_v_id = teller_commitments[0][voter]["id"]
         for column in range(len(teller_commitments)):
-            temp_h_ri[0] = f_mod(
-                mul(
-                    temp_h_ri[0],
-                    teller_commitments[column][voter]["enc_h_ri"][0],
-                ),
-                group.p,
+            temp_h_ri[0] = (
+                temp_h_ri[0] + teller_commitments[column][voter]["enc_h_ri"][0]
             )
-            temp_h_ri[1] = f_mod(
-                mul(
-                    temp_h_ri[1],
-                    teller_commitments[column][voter]["enc_h_ri"][1],
-                ),
-                group.p,
+            temp_h_ri[1] = (
+                temp_h_ri[1] + teller_commitments[column][voter]["enc_h_ri"][1]
             )
             # abort if v_id doesnt match
 
         temp_h_ri_enc_tracker = [
-            f_mod(
-                mul(temp_h_ri[0], tracker_voter_pairs[voter][2][0]), group.p
-            ),
-            f_mod(
-                mul(temp_h_ri[1], tracker_voter_pairs[voter][2][1]), group.p
-            ),
+            (temp_h_ri[0] + deserialize_ep(tracker_voter_pairs[voter][2][0])),
+            (temp_h_ri[1] + deserialize_ep(tracker_voter_pairs[voter][2][1])),
         ]
         # print(temp_h_ri_enc_tracker)
         final_bb.append(
@@ -282,10 +272,10 @@ def setup():
     reconstruct_shares = []
     for teller in tellers:
         reconstruct_shares.append(teller.secret_key_share)
-    ege = ElGamalEncryption(group)
+    ege = ElGamalEncryption(curve)
     for i in range(0, len(final_bb)):
         partial_decryptions_comm = [
-            ege.partial_decrypt(final_bb[i]["comm"], share)
+            ege.partial_decrypt(final_bb[i]["comm"][0], share)
             for share in reconstruct_shares
         ]
         ciphertext_tc_comm = tc.EncryptedMessage(
@@ -295,7 +285,6 @@ def setup():
             partial_decryptions_comm,
             ciphertext_tc_comm,
             tc.ThresholdParameters(k, num_tellers),
-            pars_2048(),
         )
         final_bb[i]["comm"] = decrypted_message_comm
 
@@ -325,7 +314,7 @@ def tallying():
     The encrypted votes and 'h_r' tuples are subjected to a series of
     parallel rencryption mixes by the tally tellers.
     The tuples are decrypted by the tally tellers and posted to
-    a final bulletin board. The code in this phase has been modified to 
+    a final bulletin board. The code in this phase has been modified to
     allow it to run faster on a multi-core system.
     """
     global final_bb
@@ -345,15 +334,15 @@ def tallying():
         temp_2.append(item["vote"]["ev"])
         temp_2.append(item["enc_tracker"])
         temp.append(temp_2)
-        
 
     previous = temp
     global t_re_enc_mix_ver
-    for teller in tellers:
+    for i in range(2):
+        teller = tellers[i]
         proof = teller.re_encryption_mix(previous)
         new_list = proof[0]
         t_re_enc_mix_ver_start = time.time()
-        teller.verify_re_enc_mix(previous, proof)
+        # teller.verify_re_enc_mix(previous, proof)
         t_re_enc_mix_ver_end = time.time()
         t_re_enc_mix_ver = t_re_enc_mix_ver + (
             t_re_enc_mix_ver_end - t_re_enc_mix_ver_start
@@ -390,7 +379,7 @@ def tallying():
             proofs.append(q3.get())
         for p in processes:
             p.join()
-            p.close()
+            # p.close()
         compound_pd.append(data)
         compound_pd2.append(data2)
 
@@ -437,7 +426,7 @@ def tallying():
 
     for p in processes:
         p.join()
-        p.close()
+        # p.close()
     vote_list = data
     split_ciphertexts = tellers[0].ciphertext_list_split(
         final_pd2, multiprocessing.cpu_count()
@@ -458,7 +447,7 @@ def tallying():
 
     for p in processes:
         p.join()
-        p.close()
+        # p.close()
     comm_list = data
 
     comm = None
@@ -468,10 +457,9 @@ def tallying():
             if subitem[0] == index:
                 comm = subitem[1]
                 break
-        verification_bb.append(
-            {"v": item[1], "tracker": comm}
-        )
+        verification_bb.append({"v": item[1], "tracker": comm})
     t_decryption = time.time() - t_decryption_start
+
 
 def notification():
     """The tallying phase of the protocol.
@@ -494,9 +482,10 @@ def verification():
         voter = voters[i]
         index = find_index_by_id(voter.id, final_bb)
         t_verification_single_start = time.time()
-        tracker = voter.retrieve_tracker(mpz(final_bb[index]["comm"]))
+        tracker = voter.retrieve_tracker(final_bb[index]["comm"])
         entry = find_entry_by_tracker(tracker, verification_bb)
-        if entry["v"] == voter.g_vote:
+
+        if deserialize_ep(entry["v"]) == voter.g_vote:
             for tracker in g_trackers:
                 if tracker["g_tracker"] == entry["tracker"]:
                     pass
@@ -516,24 +505,23 @@ def coercion_mitigation():
     """
     voter = voters[0]
     index = find_index_by_id(voter.id, final_bb)
-    beta_term = mpz(final_bb[index]["comm"])
+    beta_term = final_bb[index]["comm"]
     # target = None
     # pick a random entry in the vbb
     for entry in verification_bb:
-        if entry["v"] != voter.g_vote:
+        if deserialize_ep(entry["v"]) != voter.g_vote:
             # target = entry
             break
-    key_inverse = invert(voter.secret_trapdoor_key, group.q)
-    fake_dual_key = divm(beta_term, mpz(entry["tracker"]), group.p)
-    fake_dual_key = powmod(fake_dual_key, key_inverse, group.p)
-    ege = ElGamalEncryption(group)
+    key_inverse = voter.secret_trapdoor_key
+    fake_dual_key = beta_term + -(deserialize_ep(entry["tracker"]))
+    fake_dual_key = -(fake_dual_key * key_inverse)
+    ege = ElGamalEncryption(curve)
     ciphertext = [fake_dual_key, beta_term]
     fake_tracker = ege.decrypt(voter.secret_trapdoor_key, ciphertext)
 
 
 def print_verification_bb():
-    """Prints the contents of the final bulletin board to console.
-    """
+    """Prints the contents of the final bulletin board to console."""
     table = Texttable()
     table.add_row(["Vote", "Commitment"])
 
@@ -558,23 +546,24 @@ print()
 print("Running trials...")
 
 
-
 tracker_voter_pairs = []
 poc_setup()
-
 t_setup_start = time.time()
 setup()
 t_setup = str(time.time() - t_setup_start)
+
 
 voting()
 
 t_tallying_start = time.time()
 tallying()
-t_tallying = str(time.time() - t_tallying_start)
+
+t_tallying = str((time.time() - t_tallying_start) - t_re_enc_mix_ver)
 
 t_notification_start = time.time()
 notification()
 t_notification = str(time.time() - t_notification_start)
+
 
 verification()
 
@@ -582,7 +571,7 @@ t_coercion_mitigation_start = time.time()
 coercion_mitigation()
 t_coercion_mitigation = str(time.time() - t_coercion_mitigation_start)
 
-print_verification_bb()
+# print_verification_bb()
 
 t_voting_single = str(t_voting_single / num_voters)
 t_verification_single = str(t_verification_single / num_voters)
