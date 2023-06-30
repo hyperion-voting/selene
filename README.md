@@ -36,9 +36,9 @@ Our code requires Python 3 (=>3.8.10), the Gmpy2 library, and `tompetersen/thres
 
 1. Python 3: https://wiki.python.org/moin/BeginnersGuide/Download
 
-2. Gmpy2:  https://pypi.org/project/gmpy2/
+2. Gmpy2: https://pypi.org/project/gmpy2/
 
-3. tompetersen/threshold-crypto: Please download this library from its [github repository](https://github.com/tompetersen/threshold-crypto) and checkout the version identified by commit id `2870e48`.)
+3. tompetersen/threshold-crypto: Please download this library from its [github repository](https://github.com/tompetersen/threshold-crypto).
 
 4. Finally, use the following command to install Openpyxl (v3.1.0) and Texttable (v1.6.7): 
 ```bash
