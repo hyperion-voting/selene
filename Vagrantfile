@@ -30,8 +30,8 @@ Vagrant.configure("2") do |config|
     pip3 install -r /vagrant/requirements.txt
     git clone https://github.com/tompetersen/threshold-crypto.git
     cd threshold-crypto/
-    git checkout 2870e48cefbe1f9af1aaccf18346d984a5a8a4a1
-    pip install .
+    pip3 install -r /vagrant/requirements.txt
+    pip3 install .
     echo 'cd /vagrant' >> /home/vagrant/.bashrc
     # echo 'source venv/bin/activate' >> /home/vagrant/.bashrc
   SHELL
